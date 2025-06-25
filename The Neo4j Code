@@ -305,46 +305,65 @@ LIMIT 100;
 The community plus global 
 
 MATCH (target:QuestionnaireResponse)-[:HAS_MOOD]->(m:Mood)
-WHERE m.rating <= 2 // Bad mood
+WHERE m.rating <= 2 // Bad mood users (1=bad, 5=good)
 MATCH (p:CommunityProfile {community_id: target.mood_community})
 WITH target, 
-m, 
-p,
-target.mood_community AS community,
-CASE 
-WHEN target.phone_mins > p.phone_high THEN 'HIGH_PHONE'
-WHEN target.phone_mins < p.phone_low THEN 'LOW_PHONE'
-ELSE null
-END AS phone_status,
-CASE 
-WHEN target.sleep_mins < p.sleep_low THEN 'LOW_SLEEP'
-WHEN target.sleep_mins > p.sleep_high THEN 'HIGH_SLEEP'
-ELSE null
-END AS sleep_status
-WHERE phone_status IS NOT NULL OR sleep_status IS NOT NULL
+     m, 
+     p,
+     target.mood_community AS community,
+     CASE 
+       WHEN target.phone_mins > p.phone_high THEN 'HIGH_PHONE'
+       WHEN target.phone_mins < p.phone_low THEN 'LOW_PHONE'
+       ELSE null
+     END AS phone_status,
+     CASE 
+       WHEN target.sleep_mins < p.sleep_low THEN 'LOW_SLEEP'
+       WHEN target.sleep_mins > p.sleep_high THEN 'HIGH_SLEEP'
+       ELSE null
+     END AS sleep_status
 
-// 3. Generate specialized recommendations
+// Global wellbeing metrics (good mood users)
+OPTIONAL MATCH (grp:QuestionnaireResponse)
+WHERE grp.mood_rating >= 4 // Good mood users globally (4-5=good)
+WITH target, m, community, p, phone_status, sleep_status,
+     percentileCont(grp.phone_mins, 0.75) AS global_phone_p75,
+     percentileCont(grp.sleep_mins, 0.75) AS global_sleep_p75
+
+// Generate hybrid recommendations
 RETURN 
-target.who5 AS who5_score,
-m.rating AS current_mood,
-community,
-target.phone_mins AS current_phone,
-target.sleep_mins AS current_sleep,
-CASE phone_status
-WHEN 'HIGH_PHONE' THEN 'Reduce phone to ' + ROUND(p.phone_high) + ' mins (90th percentile)'
-WHEN 'LOW_PHONE' THEN 'Maintain low phone usage (' + ROUND(p.phone_low) + ' mins is healthy)'
-ELSE 'Phone usage normal'
-END AS phone_recommendation,
-CASE sleep_status
-WHEN 'LOW_SLEEP' THEN 'Increase sleep to ' + ROUND(p.sleep_low) + ' mins (minimum healthy)'
-WHEN 'HIGH_SLEEP' THEN 'Consider sleep quality - ' + ROUND(target.sleep_mins) + ' mins may be excessive'
-ELSE 'Sleep duration normal'
-END AS sleep_recommendation,
-'Community ' + community + ' range: Phone ' + ROUND(p.phone_low) + '-' + ROUND(p.phone_high) + 
-' mins, Sleep ' + ROUND(p.sleep_low) + '-' + ROUND(p.sleep_high) + ' mins' AS context
-ORDER BY current_mood DESC
+  target.who5 AS who5_score,
+  m.rating AS current_mood,
+  community,
+  target.phone_mins AS current_phone,
+  target.sleep_mins AS current_sleep,
+  /* Phone recommendation */
+  CASE 
+    WHEN phone_status = 'HIGH_PHONE' THEN 'COMMUNITY: Reduce phone to ' + ROUND(p.phone_high) + ' mins'
+    WHEN phone_status = 'LOW_PHONE' THEN 'COMMUNITY: Maintain low usage (' + ROUND(p.phone_low) + ' mins)'
+    WHEN target.phone_mins < 60 THEN 'GLOBAL: Consider social engagement (very low: ' + target.phone_mins + ' mins)'
+    WHEN target.phone_mins > 300 THEN 'GLOBAL: Try reducing to <300 mins'
+    ELSE 'Phone usage normal'
+  END AS phone_recommendation,
+  /* Sleep recommendation */
+  CASE 
+    WHEN sleep_status = 'LOW_SLEEP' THEN 'COMMUNITY: Increase sleep to ' + ROUND(p.sleep_low) + ' mins'
+    WHEN sleep_status = 'HIGH_SLEEP' THEN 'COMMUNITY: Evaluate sleep quality (' + ROUND(target.sleep_mins) + ' mins)'
+    WHEN target.sleep_mins < 360 THEN 'GLOBAL: Aim for 7+ hours (current: ' + ROUND(target.sleep_mins/60,1) + ' hrs)'
+    WHEN target.sleep_mins > 540 THEN 'GLOBAL: Sleep quality evaluation needed (' + ROUND(target.sleep_mins/60,1) + ' hrs)'
+    ELSE 'Sleep duration normal'
+  END AS sleep_recommendation,
+  /* Wellbeing advice */
+  CASE
+    WHEN target.who5 < 50 THEN 'URGENT: WHO-5 score indicates depression risk - consult professional'
+    WHEN target.who5 >= 50 AND target.who5 <= 69 THEN 'ADVICE: Moderate wellbeing - consider lifestyle changes'
+    ELSE 'Normal WHO-5 score'
+  END AS wellbeing_advice,
+  /* Context */
+  'Community range: Phone ' + ROUND(p.phone_low) + '-' + ROUND(p.phone_high) + 
+  ' mins, Sleep ' + ROUND(p.sleep_low) + '-' + ROUND(p.sleep_high) + ' mins | ' +
+  'Global targets: Phone <' + ROUND(global_phone_p75) + ' mins, Sleep >' + ROUND(global_sleep_p75/60,1) + ' hrs' AS context
+ORDER BY current_mood ASC  // Lower mood ratings (worse) appear first
 LIMIT 100;
-
 
 
 
@@ -355,19 +374,18 @@ LIMIT 100;
 Safe one 1 and 2 bad 
 
 
-
-/ ===============================================
+// ===============================================
 // ML-POWERED MOOD PREDICTION & INTERVENTION SYSTEM
 // ===============================================
 
 // 1. Generate mood predictions for all users
 CALL gds.alpha.pipeline.nodeRegression.predict.stream(
-'mood-regression-graph',
-{
-pipeline: 'mood-reg-pipeline',
-modelName: 'mood-regression-model',
-nodeLabels: ['QuestionnaireResponse']
-}
+  'mood-regression-graph',
+  {
+    pipeline: 'mood-reg-pipeline',
+    modelName: 'mood-regression-model',
+    nodeLabels: ['QuestionnaireResponse']
+  }
 ) YIELD nodeId, predictedValue
 WITH gds.util.asNode(nodeId) AS target, predictedValue AS predicted_mood
 
@@ -377,87 +395,94 @@ MATCH (p:CommunityProfile {community_id: target.mood_community})
 
 // 3. Determine behavior status vs community norms
 WITH target, m, p, predicted_mood,
-target.mood_community AS community,
-CASE
-WHEN target.phone_mins > p.phone_high THEN 'HIGH_PHONE'
-WHEN target.phone_mins < p.phone_low THEN 'LOW_PHONE'
-ELSE 'NORMAL'
-END AS phone_status,
-CASE
-WHEN target.sleep_mins < p.sleep_low THEN 'LOW_SLEEP'
-WHEN target.sleep_mins > p.sleep_high THEN 'HIGH_SLEEP'
-ELSE 'NORMAL'
-END AS sleep_status
+     target.mood_community AS community,
+     CASE
+       WHEN target.phone_mins > p.phone_high THEN 'HIGH_PHONE'
+       WHEN target.phone_mins < p.phone_low THEN 'LOW_PHONE'
+       ELSE 'NORMAL'
+     END AS phone_status,
+     CASE
+       WHEN target.sleep_mins < p.sleep_low THEN 'LOW_SLEEP'
+       WHEN target.sleep_mins > p.sleep_high THEN 'HIGH_SLEEP'
+       ELSE 'NORMAL'
+     END AS sleep_status
 
 // 4. Get global behavior benchmarks (from good mood users)
 OPTIONAL MATCH (global:QuestionnaireResponse)-[:HAS_MOOD]->(gm:Mood)
 WHERE gm.rating >= 4 // Good mood benchmark
 WITH target, m, p, predicted_mood, community, phone_status, sleep_status,
-percentileCont(global.phone_mins, 0.75) AS global_phone_p75,
-percentileCont(global.sleep_mins, 0.75) AS global_sleep_p75,
-abs(predicted_mood - m.rating) AS prediction_error
+     percentileCont(global.phone_mins, 0.75) AS global_phone_p75,
+     percentileCont(global.sleep_mins, 0.75) AS global_sleep_p75,
+     abs(predicted_mood - m.rating) AS prediction_error
 
 // 5. Generate actionable insights
 RETURN 
-target.who5 AS who5_score,
-community,
-// Mood metrics
-m.rating AS actual_mood,
-ROUND(predicted_mood, 2) AS predicted_mood,
-ROUND(prediction_error, 2) AS prediction_error,
-CASE 
-WHEN prediction_error < 0.5 THEN 'HIGH'
-WHEN prediction_error < 1.0 THEN 'MEDIUM'
-ELSE 'LOW'
-END AS confidence,
-// Behavior metrics
-target.phone_mins AS phone_usage,
-target.sleep_mins AS sleep_duration,
-// Phone recommendations
-CASE
-WHEN phone_status = 'HIGH_PHONE' AND predicted_mood < m.rating 
-THEN '🌎 GLOBAL: Reduce phone to ' + ROUND(p.phone_high) + ' mins (predicted mood ↓)'
-WHEN phone_status = 'HIGH_PHONE' 
-THEN '📱 COMMUNITY: Reduce phone to ' + ROUND(p.phone_high) + ' mins'
-WHEN phone_status = 'LOW_PHONE' AND predicted_mood > m.rating
-THEN '✅ POSITIVE: Maintain low usage (' + ROUND(p.phone_low) + ' mins)'
-WHEN target.phone_mins > global_phone_p75 
-THEN '🌎 GLOBAL: Try reducing to <' + ROUND(global_phone_p75) + ' mins'
-ELSE '📱 Within normal range'
-END AS phone_recommendation,
-// Sleep recommendations
-CASE
-WHEN sleep_status = 'LOW_SLEEP' AND predicted_mood < m.rating 
-THEN '🌎 GLOBAL: Increase sleep to ' + ROUND(p.sleep_low) + ' mins'
-WHEN sleep_status = 'LOW_SLEEP' 
-THEN '😴 COMMUNITY: Aim for ' + ROUND(p.sleep_low) + '+' + ' mins'
-WHEN sleep_status = 'HIGH_SLEEP' 
-THEN '🔍 QUALITY: Evaluate sleep quality'
-WHEN target.sleep_mins < global_sleep_p75 
-THEN '🌎 GLOBAL: Target >' + ROUND(global_sleep_p75/60,1) + ' hrs'
-ELSE '😴 Within normal range'
-END AS sleep_recommendation,
-// Wellbeing guidance
-CASE
-WHEN target.who5 < 50 AND predicted_mood < 3 
-THEN '🌎 GLOBAL: Immediate professional help needed'
-WHEN target.who5 < 50 
-THEN '⚠️ URGENT: Consult mental health professional'
-WHEN predicted_mood < m.rating 
-THEN '📉 WARNING: Potential mood decline'
-ELSE '✅ Stable wellbeing predicted'
-END AS wellbeing_alert,
-// Priority scoring (0-100)
-ROUND(
-(CASE WHEN target.who5 < 50 THEN 40 ELSE 0 END) +
-(CASE WHEN prediction_error > 1 THEN 20 ELSE 0 END) +
-(CASE WHEN phone_status = 'HIGH_PHONE' THEN 15 ELSE 0 END) +
-(CASE WHEN sleep_status = 'LOW_SLEEP' THEN 15 ELSE 0 END) +
-(CASE WHEN predicted_mood < 3 THEN 10 ELSE 0 END)
-) AS priority_score,
-// Context for interpretation
-'Community norms: ' + ROUND(p.phone_low) + '-' + ROUND(p.phone_high) + 
-' mins phone, ' + ROUND(p.sleep_low/60,1) + '-' + ROUND(p.sleep_high/60,1) + ' hrs sleep' AS community_context
+  target.who5 AS who5_score,
+  community,
+  
+  // Mood metrics
+  m.rating AS actual_mood,
+  ROUND(predicted_mood, 2) AS predicted_mood,
+  ROUND(prediction_error, 2) AS prediction_error,
+  CASE 
+    WHEN prediction_error < 0.5 THEN 'HIGH'
+    WHEN prediction_error < 1.0 THEN 'MEDIUM'
+    ELSE 'LOW'
+  END AS confidence,
+  
+  // Behavior metrics
+  target.phone_mins AS phone_usage,
+  target.sleep_mins AS sleep_duration,
+  
+  // Phone recommendations
+  CASE
+    WHEN phone_status = 'HIGH_PHONE' AND predicted_mood < m.rating 
+      THEN '🌎 GLOBAL: Reduce phone to ' + ROUND(p.phone_high) + ' mins (predicted mood ↓)'
+    WHEN phone_status = 'HIGH_PHONE' 
+      THEN '📱 COMMUNITY: Reduce phone to ' + ROUND(p.phone_high) + ' mins'
+    WHEN phone_status = 'LOW_PHONE' AND predicted_mood > m.rating
+      THEN '✅ POSITIVE: Maintain low usage (' + ROUND(p.phone_low) + ' mins)'
+    WHEN target.phone_mins > global_phone_p75 
+      THEN '🌎 GLOBAL: Try reducing to <' + ROUND(global_phone_p75) + ' mins'
+    ELSE '📱 Within normal range'
+  END AS phone_recommendation,
+  
+  // Sleep recommendations
+  CASE
+    WHEN sleep_status = 'LOW_SLEEP' AND predicted_mood < m.rating 
+      THEN '🌎 GLOBAL: Increase sleep to ' + ROUND(p.sleep_low) + ' mins'
+    WHEN sleep_status = 'LOW_SLEEP' 
+      THEN '😴 COMMUNITY: Aim for ' + ROUND(p.sleep_low) + '+' + ' mins'
+    WHEN sleep_status = 'HIGH_SLEEP' 
+      THEN '🔍 QUALITY: Evaluate sleep quality'
+    WHEN target.sleep_mins < global_sleep_p75 
+      THEN '🌎 GLOBAL: Target >' + ROUND(global_sleep_p75/60,1) + ' hrs'
+    ELSE '😴 Within normal range'
+  END AS sleep_recommendation,
+  
+  // Wellbeing guidance
+  CASE
+    WHEN target.who5 < 50 AND predicted_mood < 3 
+      THEN '🌎 GLOBAL: Immediate professional help needed'
+    WHEN target.who5 < 50 
+      THEN '⚠️ URGENT: Consult mental health professional'
+    WHEN predicted_mood < m.rating 
+      THEN '📉 WARNING: Potential mood decline'
+    ELSE '✅ Stable wellbeing predicted'
+  END AS wellbeing_alert,
+  
+  // Priority scoring (0-100)
+  ROUND(
+    (CASE WHEN target.who5 < 50 THEN 40 ELSE 0 END) +
+    (CASE WHEN prediction_error > 1 THEN 20 ELSE 0 END) +
+    (CASE WHEN phone_status = 'HIGH_PHONE' THEN 15 ELSE 0 END) +
+    (CASE WHEN sleep_status = 'LOW_SLEEP' THEN 15 ELSE 0 END) +
+    (CASE WHEN predicted_mood < 3 THEN 10 ELSE 0 END)
+  ) AS priority_score,
+  
+  // Context for interpretation
+  'Community norms: ' + ROUND(p.phone_low) + '-' + ROUND(p.phone_high) + 
+  ' mins phone, ' + ROUND(p.sleep_low/60,1) + '-' + ROUND(p.sleep_high/60,1) + ' hrs sleep' AS community_context
 
 ORDER BY priority_score DESC, prediction_error DESC
 LIMIT 50;
