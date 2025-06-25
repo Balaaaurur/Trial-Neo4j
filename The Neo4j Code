@@ -1,0 +1,463 @@
+Trial
+
+File integration 
+
+LOAD CSV WITH HEADERS FROM 'file:///Extended_WHO_Mood_Data.csv' AS row
+CREATE (qr:QuestionnaireResponse {who5: toInteger(row.WHO)})
+MERGE (m:Mood {rating: toInteger(row.mood_rating)})
+CREATE (t:TelephoneUsage {duration: row.Use_of_telephone})
+CREATE (s:Sleep {duration: row.Amount_of_sleep})
+CREATE (qr)-[:HAS_MOOD]->(m)
+CREATE (qr)-[:RECORDED_TELEPHONE_USAGE]->(t)
+CREATE (qr)-[:RECORDED_SLEEP]->(s);
+
+To minutes 
+
+MATCH (t:TelephoneUsage)
+WHERE t.duration_minutes IS NULL
+SET t.duration_minutes =
+toInteger(split(t.duration, ':')[0]) * 60 +
+toInteger(split(t.duration, ':')[1]),
+t.duration_hours = toFloat(t.duration_minutes) / 60.0;
+
+// Add minute conversions to existing Sleep nodes
+MATCH (s:Sleep)
+WHERE s.duration_minutes IS NULL
+SET s.duration_minutes =
+toInteger(split(s.duration, ':')[0]) * 60 +
+toInteger(split(s.duration, ':')[1]),
+s.duration_hours = toFloat(s.duration_minutes) / 60.0;
+
+// Add original format properties to QuestionnaireResponse
+MATCH (qr:QuestionnaireResponse)
+WHERE qr.original_telephone IS NULL
+SET qr.original_telephone =
+[(qr)-[:RECORDED_TELEPHONE_USAGE]->(t) | t.duration][0],
+qr.original_sleep =
+[(qr)-[:RECORDED_SLEEP]->(s) | s.duration][0];
+
+
+Correlation
+
+MATCH (qr:QuestionnaireResponse)-[:HAS_MOOD]->(m:Mood)
+OPTIONAL MATCH (qr)-[:RECORDED_TELEPHONE_USAGE]->(t:TelephoneUsage)
+OPTIONAL MATCH (qr)-[:RECORDED_SLEEP]->(s:Sleep)
+WITH collect({
+who5: qr.who5,
+mood: m.rating,
+tel_minutes: t.duration_minutes,
+sleep_minutes: s.duration_minutes
+}) as data
+UNWIND [
+{factor: "WHO-5", values: [x IN data WHERE x.who5 IS NOT NULL | [toFloat(x.who5), toFloat(x.mood)]]},
+{factor: "Telephone", values: [x IN data WHERE x.tel_minutes IS NOT NULL | [toFloat(x.tel_minutes), toFloat(x.mood)]]},
+{factor: "Sleep", values: [x IN data WHERE x.sleep_minutes IS NOT NULL | [toFloat(x.sleep_minutes), toFloat(x.mood)]]}
+] as factor_data
+WITH factor_data.factor as factor, factor_data.values as pairs
+WHERE size(pairs) > 1
+WITH factor, pairs,
+size(pairs) as n,
+reduce(sum = 0.0, pair IN pairs | sum + pair[0]) as sum_x,
+reduce(sum = 0.0, pair IN pairs | sum + pair[1]) as sum_y,
+reduce(sum = 0.0, pair IN pairs | sum + pair[0] * pair[1]) as sum_xy,
+reduce(sum = 0.0, pair IN pairs | sum + pair[0] * pair[0]) as sum_x_sq,
+reduce(sum = 0.0, pair IN pairs | sum + pair[1] * pair[1]) as sum_y_sq
+WITH factor, n, sum_x, sum_y, sum_xy, sum_x_sq, sum_y_sq,
+(n * sum_xy - sum_x * sum_y) as numerator,
+sqrt((n * sum_x_sq - sum_x * sum_x) * (n * sum_y_sq - sum_y * sum_y)) as denominator
+RETURN factor,
+CASE WHEN denominator = 0 THEN 0 ELSE numerator / denominator END as correlation,
+n as sample_size,
+CASE
+WHEN abs(numerator / denominator) > 0.7 THEN "Strong"
+WHEN abs(numerator / denominator) > 0.5 THEN "Moderate"
+WHEN abs(numerator / denominator) > 0.3 THEN "Weak"
+ELSE "Very Weak"
+END as strength
+ORDER BY abs(correlation) DESC;
+
+Insert Questionair 
+
+
+MATCH (qr:QuestionnaireResponse)-[:HAS_MOOD]->(m:Mood)
+SET qr.mood_rating = m.rating;
+
+
+Make sure is there 
+
+MATCH (qr:QuestionnaireResponse)
+WHERE qr.mood_rating IS NOT NULL
+OPTIONAL MATCH (qr)-[:RECORDED_TELEPHONE_USAGE]->(t:TelephoneUsage)
+OPTIONAL MATCH (qr)-[:RECORDED_SLEEP]->(s:Sleep)
+RETURN count(*) as valid_records;
+
+MATCH (qr:QuestionnaireResponse)
+OPTIONAL MATCH (qr)-[:RECORDED_TELEPHONE_USAGE]->(t:TelephoneUsage)
+OPTIONAL MATCH (qr)-[:RECORDED_SLEEP]->(s:Sleep)
+SET qr.phone_mins = t.duration_minutes,
+    qr.sleep_mins = s.duration_minutes;
+
+MATCH (qr:QuestionnaireResponse)
+RETURN qr.who5, qr.phone_mins, qr.sleep_mins, qr.mood_rating
+LIMIT 10;
+
+Graph Projection 
+
+CALL gds.graph.project(
+'mood-regression-graph',
+{
+QuestionnaireResponse: {
+properties: {
+who5: {property: 'who5'},
+telephone_minutes: {property: 'phone_mins'},
+sleep_minutes: {property: 'sleep_mins'},
+mood_rating: {property: 'mood_rating'} // Target property for regression
+}
+}
+},
+{
+HAS_MOOD: {
+type: 'HAS_MOOD',
+orientation: 'UNDIRECTED',
+properties: {} // No relationship properties needed
+},
+RECORDED_TELEPHONE_USAGE: {
+type: 'RECORDED_TELEPHONE_USAGE',
+orientation: 'NATURAL'
+},
+RECORDED_SLEEP: {
+type: 'RECORDED_SLEEP',
+orientation: 'NATURAL'
+}
+}
+);
+
+Embeddings 
+
+CALL gds.beta.node2vec.write('mood-graph', {
+embeddingDimension: 64,
+walkLength: 50,
+writeProperty: 'mood_embedding'
+});
+Community and similarity kNN
+
+CALL gds.graph.project(
+  'embedding-graph',
+  {
+    QuestionnaireResponse: {
+      properties: ['mood_embedding']
+    }
+  },
+  '*'  // Include all relationships
+);
+
+CALL gds.knn.write(
+  'embedding-graph',
+  {
+    topK: 5,
+    nodeProperties: ['mood_embedding'],
+    randomSeed: 42,
+    writeRelationshipType: 'SIMILAR_MOOD_PATTERN',
+    writeProperty: 'pattern_similarity'
+  }
+) YIELD nodesCompared, similarityDistribution;
+
+// 2. Louvain Community Detection
+CALL gds.graph.project(
+  'community-graph',
+  'QuestionnaireResponse',
+  {
+    SIMILAR_MOOD_PATTERN: {
+      type: 'SIMILAR_MOOD_PATTERN',
+      orientation: 'UNDIRECTED',
+      properties: ['pattern_similarity']
+    }
+  }
+);
+
+CALL gds.louvain.write(
+  'community-graph',
+  {
+    relationshipWeightProperty: 'pattern_similarity',
+    writeProperty: 'mood_community'
+  }
+) YIELD communityCount, modularity;
+
+
+Pipeline 
+
+CALL gds.alpha.pipeline.nodeRegression.create('mood-reg-pipeline');
+
+
+CALL gds.alpha.pipeline.nodeRegression.selectFeatures(
+'mood-reg-pipeline', 
+['who5', 'telephone_minutes', 'sleep_minutes']
+);
+
+
+CALL gds.alpha.pipeline.nodeRegression.addRandomForest(
+'mood-reg-pipeline',
+{
+numberOfDecisionTrees: 120,
+maxDepth: 8,
+minSplitSize: 30,
+minLeafSize: 20
+}
+);
+
+
+Final one Mae
+
+CALL gds.alpha.pipeline.nodeRegression.train(
+'mood-regression-graph',
+{
+pipeline: 'mood-reg-pipeline',
+modelName: 'mood-regression-model',
+targetProperty: 'mood_rating', // Predict mood rating (1-5)
+nodeLabels: ['QuestionnaireResponse'],
+relationshipTypes: ['HAS_MOOD'],
+metrics: ['MEAN_SQUARED_ERROR', 'MEAN_ABSOLUTE_ERROR'],
+randomSeed: 42
+}
+) YIELD modelInfo
+RETURN modelInfo.modelName AS modelName,
+modelInfo.metrics.MEAN_ABSOLUTE_ERROR AS mae;
+
+
+
+See graph 
+
+MATCH path=(qr:QuestionnaireResponse)-[:HAS_MOOD|RECORDED_TELEPHONE_USAGE|RECORDED_SLEEP]->()
+RETURN path
+LIMIT 10;
+
+
+Others 
+
+// Transfer time data to QuestionnaireResponse nodes
+MATCH (qr:QuestionnaireResponse)
+OPTIONAL MATCH (qr)-[:RECORDED_TELEPHONE_USAGE]->(t:TelephoneUsage)
+OPTIONAL MATCH (qr)-[:RECORDED_SLEEP]->(s:Sleep)
+OPTIONAL MATCH (qr)-[:HAS_MOOD]->(m:Mood)
+SET qr.phone_mins = COALESCE(t.duration_minutes, 0),
+qr.sleep_mins = COALESCE(s.duration_minutes, 0),
+qr.mood_rating = COALESCE(m.rating, 0);
+
+
+Before them 
+
+MATCH (c:QuestionnaireResponse)
+WITH c.mood_community AS community, 
+percentileCont(c.phone_mins, 0.1) AS phone_low,
+percentileCont(c.phone_mins, 0.9) AS phone_high,
+percentileCont(c.sleep_mins, 0.1) AS sleep_low,
+percentileCont(c.sleep_mins, 0.9) AS sleep_high
+MERGE (p:CommunityProfile {community_id: community})
+SET p.phone_low = phone_low,
+p.phone_high = phone_high,
+p.sleep_low = sleep_low,
+p.sleep_high = sleep_high;
+
+
+Community outliers and algorithm as such 
+
+MATCH (target:QuestionnaireResponse)-[:HAS_MOOD]->(m:Mood)
+WHERE m.rating <= 2 // Bad mood
+MATCH (p:CommunityProfile {community_id: target.mood_community})
+WITH target, 
+m, 
+p,
+target.mood_community AS community,
+CASE 
+WHEN target.phone_mins > p.phone_high THEN 'HIGH_PHONE'
+WHEN target.phone_mins < p.phone_low THEN 'LOW_PHONE'
+ELSE null
+END AS phone_status,
+CASE 
+WHEN target.sleep_mins < p.sleep_low THEN 'LOW_SLEEP'
+WHEN target.sleep_mins > p.sleep_high THEN 'HIGH_SLEEP'
+ELSE null
+END AS sleep_status
+WHERE phone_status IS NOT NULL OR sleep_status IS NOT NULL
+
+// 3. Generate specialized recommendations
+RETURN 
+target.who5 AS who5_score,
+m.rating AS current_mood,
+community,
+target.phone_mins AS current_phone,
+target.sleep_mins AS current_sleep,
+CASE phone_status
+WHEN 'HIGH_PHONE' THEN 'Reduce phone to ' + ROUND(p.phone_high) + ' mins (90th percentile)'
+WHEN 'LOW_PHONE' THEN 'Maintain low phone usage (' + ROUND(p.phone_low) + ' mins is healthy)'
+ELSE 'Phone usage normal'
+END AS phone_recommendation,
+CASE sleep_status
+WHEN 'LOW_SLEEP' THEN 'Increase sleep to ' + ROUND(p.sleep_low) + ' mins (minimum healthy)'
+WHEN 'HIGH_SLEEP' THEN 'Consider sleep quality - ' + ROUND(target.sleep_mins) + ' mins may be excessive'
+ELSE 'Sleep duration normal'
+END AS sleep_recommendation,
+'Community ' + community + ' range: Phone ' + ROUND(p.phone_low) + '-' + ROUND(p.phone_high) + 
+' mins, Sleep ' + ROUND(p.sleep_low) + '-' + ROUND(p.sleep_high) + ' mins' AS context
+ORDER BY current_mood DESC
+LIMIT 100;
+
+The community plus global 
+
+MATCH (target:QuestionnaireResponse)-[:HAS_MOOD]->(m:Mood)
+WHERE m.rating <= 2 // Bad mood
+MATCH (p:CommunityProfile {community_id: target.mood_community})
+WITH target, 
+m, 
+p,
+target.mood_community AS community,
+CASE 
+WHEN target.phone_mins > p.phone_high THEN 'HIGH_PHONE'
+WHEN target.phone_mins < p.phone_low THEN 'LOW_PHONE'
+ELSE null
+END AS phone_status,
+CASE 
+WHEN target.sleep_mins < p.sleep_low THEN 'LOW_SLEEP'
+WHEN target.sleep_mins > p.sleep_high THEN 'HIGH_SLEEP'
+ELSE null
+END AS sleep_status
+WHERE phone_status IS NOT NULL OR sleep_status IS NOT NULL
+
+// 3. Generate specialized recommendations
+RETURN 
+target.who5 AS who5_score,
+m.rating AS current_mood,
+community,
+target.phone_mins AS current_phone,
+target.sleep_mins AS current_sleep,
+CASE phone_status
+WHEN 'HIGH_PHONE' THEN 'Reduce phone to ' + ROUND(p.phone_high) + ' mins (90th percentile)'
+WHEN 'LOW_PHONE' THEN 'Maintain low phone usage (' + ROUND(p.phone_low) + ' mins is healthy)'
+ELSE 'Phone usage normal'
+END AS phone_recommendation,
+CASE sleep_status
+WHEN 'LOW_SLEEP' THEN 'Increase sleep to ' + ROUND(p.sleep_low) + ' mins (minimum healthy)'
+WHEN 'HIGH_SLEEP' THEN 'Consider sleep quality - ' + ROUND(target.sleep_mins) + ' mins may be excessive'
+ELSE 'Sleep duration normal'
+END AS sleep_recommendation,
+'Community ' + community + ' range: Phone ' + ROUND(p.phone_low) + '-' + ROUND(p.phone_high) + 
+' mins, Sleep ' + ROUND(p.sleep_low) + '-' + ROUND(p.sleep_high) + ' mins' AS context
+ORDER BY current_mood DESC
+LIMIT 100;
+
+
+
+
+
+
+
+
+Safe one 1 and 2 bad 
+
+
+
+/ ===============================================
+// ML-POWERED MOOD PREDICTION & INTERVENTION SYSTEM
+// ===============================================
+
+// 1. Generate mood predictions for all users
+CALL gds.alpha.pipeline.nodeRegression.predict.stream(
+'mood-regression-graph',
+{
+pipeline: 'mood-reg-pipeline',
+modelName: 'mood-regression-model',
+nodeLabels: ['QuestionnaireResponse']
+}
+) YIELD nodeId, predictedValue
+WITH gds.util.asNode(nodeId) AS target, predictedValue AS predicted_mood
+
+// 2. Retrieve actual mood and community context
+MATCH (target)-[:HAS_MOOD]->(m:Mood)
+MATCH (p:CommunityProfile {community_id: target.mood_community})
+
+// 3. Determine behavior status vs community norms
+WITH target, m, p, predicted_mood,
+target.mood_community AS community,
+CASE
+WHEN target.phone_mins > p.phone_high THEN 'HIGH_PHONE'
+WHEN target.phone_mins < p.phone_low THEN 'LOW_PHONE'
+ELSE 'NORMAL'
+END AS phone_status,
+CASE
+WHEN target.sleep_mins < p.sleep_low THEN 'LOW_SLEEP'
+WHEN target.sleep_mins > p.sleep_high THEN 'HIGH_SLEEP'
+ELSE 'NORMAL'
+END AS sleep_status
+
+// 4. Get global behavior benchmarks (from good mood users)
+OPTIONAL MATCH (global:QuestionnaireResponse)-[:HAS_MOOD]->(gm:Mood)
+WHERE gm.rating >= 4 // Good mood benchmark
+WITH target, m, p, predicted_mood, community, phone_status, sleep_status,
+percentileCont(global.phone_mins, 0.75) AS global_phone_p75,
+percentileCont(global.sleep_mins, 0.75) AS global_sleep_p75,
+abs(predicted_mood - m.rating) AS prediction_error
+
+// 5. Generate actionable insights
+RETURN 
+target.who5 AS who5_score,
+community,
+// Mood metrics
+m.rating AS actual_mood,
+ROUND(predicted_mood, 2) AS predicted_mood,
+ROUND(prediction_error, 2) AS prediction_error,
+CASE 
+WHEN prediction_error < 0.5 THEN 'HIGH'
+WHEN prediction_error < 1.0 THEN 'MEDIUM'
+ELSE 'LOW'
+END AS confidence,
+// Behavior metrics
+target.phone_mins AS phone_usage,
+target.sleep_mins AS sleep_duration,
+// Phone recommendations
+CASE
+WHEN phone_status = 'HIGH_PHONE' AND predicted_mood < m.rating 
+THEN '🌎 GLOBAL: Reduce phone to ' + ROUND(p.phone_high) + ' mins (predicted mood ↓)'
+WHEN phone_status = 'HIGH_PHONE' 
+THEN '📱 COMMUNITY: Reduce phone to ' + ROUND(p.phone_high) + ' mins'
+WHEN phone_status = 'LOW_PHONE' AND predicted_mood > m.rating
+THEN '✅ POSITIVE: Maintain low usage (' + ROUND(p.phone_low) + ' mins)'
+WHEN target.phone_mins > global_phone_p75 
+THEN '🌎 GLOBAL: Try reducing to <' + ROUND(global_phone_p75) + ' mins'
+ELSE '📱 Within normal range'
+END AS phone_recommendation,
+// Sleep recommendations
+CASE
+WHEN sleep_status = 'LOW_SLEEP' AND predicted_mood < m.rating 
+THEN '🌎 GLOBAL: Increase sleep to ' + ROUND(p.sleep_low) + ' mins'
+WHEN sleep_status = 'LOW_SLEEP' 
+THEN '😴 COMMUNITY: Aim for ' + ROUND(p.sleep_low) + '+' + ' mins'
+WHEN sleep_status = 'HIGH_SLEEP' 
+THEN '🔍 QUALITY: Evaluate sleep quality'
+WHEN target.sleep_mins < global_sleep_p75 
+THEN '🌎 GLOBAL: Target >' + ROUND(global_sleep_p75/60,1) + ' hrs'
+ELSE '😴 Within normal range'
+END AS sleep_recommendation,
+// Wellbeing guidance
+CASE
+WHEN target.who5 < 50 AND predicted_mood < 3 
+THEN '🌎 GLOBAL: Immediate professional help needed'
+WHEN target.who5 < 50 
+THEN '⚠️ URGENT: Consult mental health professional'
+WHEN predicted_mood < m.rating 
+THEN '📉 WARNING: Potential mood decline'
+ELSE '✅ Stable wellbeing predicted'
+END AS wellbeing_alert,
+// Priority scoring (0-100)
+ROUND(
+(CASE WHEN target.who5 < 50 THEN 40 ELSE 0 END) +
+(CASE WHEN prediction_error > 1 THEN 20 ELSE 0 END) +
+(CASE WHEN phone_status = 'HIGH_PHONE' THEN 15 ELSE 0 END) +
+(CASE WHEN sleep_status = 'LOW_SLEEP' THEN 15 ELSE 0 END) +
+(CASE WHEN predicted_mood < 3 THEN 10 ELSE 0 END)
+) AS priority_score,
+// Context for interpretation
+'Community norms: ' + ROUND(p.phone_low) + '-' + ROUND(p.phone_high) + 
+' mins phone, ' + ROUND(p.sleep_low/60,1) + '-' + ROUND(p.sleep_high/60,1) + ' hrs sleep' AS community_context
+
+ORDER BY priority_score DESC, prediction_error DESC
+LIMIT 50;
